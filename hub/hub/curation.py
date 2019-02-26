@@ -84,6 +84,29 @@ class Curation(object):
 
 		return self.post_process_item_details(items)
 
+	def get_items_sorted_by_views(self, filters=None, limit=20):
+		base_filters = {
+			'published': 1
+		}
+		
+		if filters:
+			base_filters.update(filters)
+
+		conditions, values = frappe.db.build_conditions(filters)
+		items = frappe.db.sql("""
+				Select name, item_name, image, description, creation, hub_seller
+				from `tabHub Item`,
+						(SELECT count(name) view_count, reference_hub_item
+						from `tabHub Log`
+						where type = 'Hub Item View'
+						group by reference_hub_item) as item_views {where}
+				{conditions}
+					and `tabHub Item`.name = item_views.reference_hub_item
+				order by item_views.view_count DESC
+				limit {limit}
+				""".format(where="where" if conditions else "", conditions=conditions,limit=int(limit)),values, as_dict=True)
+		return self.post_process_item_details(items)
+		
 
 	def post_process_item_details(self, items):
 		items = self.get_item_details_and_company_name(items)

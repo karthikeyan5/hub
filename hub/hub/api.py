@@ -2,6 +2,7 @@
 # For license information, please see license.txt
 
 from __future__ import unicode_literals
+import datetime
 import frappe
 import json
 
@@ -11,7 +12,10 @@ from six import string_types
 from six.moves.urllib.parse import urljoin
 
 from .curation import Curation
-from .utils import save_remote_file_locally
+from .utils import (
+	save_remote_file_locally,
+	check_user_and_item_belong_to_same_seller
+)
 
 from .log import (
 	add_log,
@@ -86,14 +90,17 @@ def add_hub_user(user_email, hub_seller, first_name, last_name=None):
 		user.new_password = password
 		user.save(ignore_permissions=True)
 
-	hub_user = frappe.get_doc({
-		'doctype': 'Hub User',
-		'hub_seller': hub_seller,
-		'user_email': user_email,
-		'first_name': first_name,
-		'last_name': last_name,
-		'user': user.name
-	}).insert(ignore_permissions=True)
+	try:
+		hub_user = frappe.get_doc({
+			'doctype': 'Hub User',
+			'hub_seller': hub_seller,
+			'user_email': user_email,
+			'first_name': first_name,
+			'last_name': last_name,
+			'user': user.name
+		}).insert(ignore_permissions=True)
+	except frappe.DuplicateEntryError:
+		hub_user = frappe.get_doc('Hub User', user.name)
 
 	return {
 		'user_email': user_email,
@@ -134,10 +141,13 @@ def get_data_for_homepage(country=None):
 
 
 @frappe.whitelist(allow_guest=True)
-def get_items(keyword='', hub_seller=None, filters={}):
+def get_items(keyword='', hub_seller=None, company=None, filters={}):
 	'''
 	Get items by matching it with the keywords field
 	'''
+	if not hub_seller and company:
+		hub_seller = frappe.db.get_all(
+			"Hub Seller", filters={'company': company})[0].name
 	c = Curation()
 
 	if isinstance(filters, string_types):
@@ -206,20 +216,30 @@ def post_items_publish():
 
 
 @frappe.whitelist(allow_guest=True)
-def get_hub_seller_page_info(hub_seller='', company=''):
+def get_hub_seller_page_info(hub_seller=None, company=None):
 	if not hub_seller and company:
 		hub_seller = frappe.db.get_all(
 			"Hub Seller", filters={'company': company})[0].name
-	else:
+	elif not hub_seller:
 		frappe.throw('No Seller or Company Name received.')
 
 	items_by_seller = Curation().get_items(filters={
-		'hub_seller': hub_seller
+		'hub_seller': hub_seller,
+		'featured_item':1
 	})
+	is_featured = True
+	if len(items_by_seller) == 0:
+		is_featured = False
+		items_by_seller = Curation().get_items_sorted_by_views(filters={
+			'hub_seller': hub_seller
+		},limit=8)
 
 	return {
 		'profile': get_hub_seller_profile(hub_seller),
-		'items': items_by_seller
+		'items': items_by_seller,
+		'is_featured_item': is_featured,
+		'recent_seller_reviews': get_seller_reviews(hub_seller),
+		'seller_product_view_stats': get_seller_product_view_stats(hub_seller)
 	}
 
 
@@ -248,17 +268,60 @@ def get_item_reviews(hub_item_name):
 		'parenttype': 'Hub Item',
 		'parentfield': 'reviews',
 		'parent': hub_item_name
-	}, order_by='modified desc')
+	}, order_by='timestamp desc')
 
 	return reviews or []
 
+@frappe.whitelist(allow_guest=True)
+def get_seller_reviews(hub_seller, limit = 4):
+	reviews = frappe.db.sql("""
+			select c.*
+				from `tabHub Item Review` as c,
+					`tabHub Item` as p
+				where p.name = c.parent
+				and p.hub_seller = %(hub_seller)s
+				order by c.timestamp desc
+				limit {limit}
+	""".format(limit=int(limit)),{"hub_seller":hub_seller},as_dict=True)
 
+	return reviews or []
+
+@frappe.whitelist(allow_guest=True)
+def get_seller_product_view_stats(hub_seller):
+	days = 14
+	view_stats = frappe.db.sql("""
+	SELECT count(log.name) as view_count, DATE(log.creation) as date
+		from `tabHub Item` as item,
+			`tabHub Log` as log
+		where item.name = log.reference_hub_item
+		and log.type = 'Hub Item View'
+		and item.hub_seller = %(hub_seller)s
+		and log.creation > DATE_SUB(date(now()),INTERVAL %(days)s DAY)
+		group by DATE(log.creation)
+		order by DATE(log.creation)
+	""",{"hub_seller":hub_seller,
+		"days":days},as_dict=True)
+	
+	# result needs to be ordered by date for the below to work as expected
+	stats = []
+	if len(view_stats) > 0:
+		for i in range(days+1):
+			date = datetime.date.today() - datetime.timedelta(days=days-i)
+			stat = {'view_count':0,'date':date}
+			if len(view_stats) > 0 and view_stats[0]['date'] == date:
+				stat['view_count'] = view_stats[0]['view_count']
+				view_stats.pop(0)
+			stats.append(frappe._dict(stat))
+		
+
+	return stats
 
 @frappe.whitelist()
 def add_item_review(hub_item_name, review):
 	'''Adds a review record for Hub Item and limits to 1 per user'''
 	new_review = frappe._dict(json.loads(review))
 	new_review.user = frappe.session.user
+	new_review.timestamp = datetime.datetime.now()
 
 	item_doc = frappe.get_doc('Hub Item', hub_item_name)
 	existing_reviews = item_doc.get('reviews')
@@ -339,6 +402,44 @@ def get_saved_items_of_user():
 
 	return get_items(filters={'name': ['in', saved_item_names]})
 
+# Featured Items
+
+@frappe.whitelist()
+def add_item_to_seller_featured_items(hub_item_name):
+	hub_user = frappe.session.user
+	item_hub_seller_name = frappe.db.get_value('Hub Item', hub_item_name, fieldname=['hub_seller'])
+
+	check_user_and_item_belong_to_same_seller(hub_user,hub_item_name)
+	
+	# validation: max 8 featured items per seller
+	if frappe.db.count('Hub Item' ,{'hub_seller':item_hub_seller_name,'featured_item':1}) >= 8:
+		frappe.throw(_("You already have 8 featured items. You can feature only 8 items."))
+	
+	log = add_log('Hub Feature Item', hub_item_name, hub_user, 1)
+	frappe.db.set_value("Hub Item", hub_item_name, "featured_item", 1)
+	return log
+
+
+@frappe.whitelist()
+def remove_item_from_seller_featured_items(hub_item_name):
+	hub_user = frappe.session.user
+
+	check_user_and_item_belong_to_same_seller(hub_user,hub_item_name)
+
+	log = add_log('Hub Feature Item', hub_item_name, hub_user, 0)
+	frappe.db.set_value("Hub Item", hub_item_name, "featured_item", 0)
+	return log
+
+
+@frappe.whitelist()
+def get_featured_items_of_seller():
+	hub_user = frappe.session.user
+	user_hub_seller_name = frappe.db.get_value('Hub User', hub_user, fieldname=['hub_seller'])
+
+	return get_items(filters={
+		'hub_seller': user_hub_seller_name,
+		'featured_item':1
+	})
 
 @frappe.whitelist()
 def get_sellers_with_interactions(for_seller):

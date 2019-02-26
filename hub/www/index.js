@@ -18,6 +18,7 @@ function ready() {
             frappe.set_route('marketplace/home');
         }
     });
+    frappe.require('/assets/frappe/js/lib/frappe-charts/frappe-charts.min.iife.js')
 }
 
 frappe.ready(ready);
