@@ -4,7 +4,6 @@
 
 from __future__ import unicode_literals
 import frappe
-from frappe import _
 import os
 import requests
 import base64
@@ -44,12 +43,3 @@ def save_remote_file_locally(file_url, doctype, name):
 		f.save()
 
 	return f
-
-def check_user_and_item_belong_to_same_seller(hub_user,hub_item_name):
-	'''
-	Check if item and user belong to same seller.
-	'''
-	item_hub_seller_name = frappe.db.get_value('Hub Item', hub_item_name, fieldname=['hub_seller'])
-	if item_hub_seller_name != frappe.db.get_value('Hub User', hub_user, fieldname=['hub_seller']):
-		frappe.throw(_("You can only feature your own published items"))
-	return
